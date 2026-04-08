@@ -1,0 +1,48 @@
+# -------- Python --------
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pyc.*
+
+# -------- Virtual Environment --------
+venv/
+.env/
+.env.*
+
+# -------- IDE --------
+.vscode/
+.idea/
+
+# -------- OS Files --------
+.DS_Store
+Thumbs.db
+
+# -------- Logs --------
+*.log
+
+# -------- Model Files (VERY IMPORTANT) --------
+*.pth
+*.pt
+*.h5
+*.onnx
+
+# -------- Large Files / Data --------
+*.zip
+*.tar
+*.gz
+
+# -------- Inputs / Outputs --------
+inputs/
+outputs/
+
+# -------- Notebooks --------
+.ipynb_checkpoints/
+
+# -------- TensorBoard --------
+runs/
+logs/
+
+# -------- Misc --------
+*.sqlite3
+*.db
