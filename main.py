@@ -208,6 +208,22 @@ def color_mask(mask):
 
     return colored
 
+def max_horizontal_diameter(mask):
+    """
+    mask: binary mask (H, W)
+    returns: max horizontal diameter in pixels
+    """
+    rows = np.any(mask, axis=1)
+    if not rows.any():
+        return 0.0
+
+    diameters = []
+    for row in range(mask.shape[0]):
+        cols = np.where(mask[row] > 0)[0]
+        if len(cols) > 0:
+            diameters.append(cols[-1] - cols[0])
+
+    return float(max(diameters)) if diameters else 0.0
 # -------- FASTAPI --------
 app = FastAPI()
 from fastapi.staticfiles import StaticFiles
@@ -228,9 +244,11 @@ async def brain_abnormalities(file: UploadFile = File(...)):
     # -------- PREDICT --------
     class_name ,confidence = predict_brain(file_path)
     confidence = float(confidence)
-    return {"class_name":class_name,"confidence": confidence,
-            "file_saved_as": unique_name,
-    "output_url": f"http://127.0.0.1:8000/outputs/{unique_name}"
+    return {
+        "class_name":class_name,
+        "confidence": confidence,
+        "file_saved_as": unique_name,
+        "output_url": f"http://127.0.0.1:8000/outputs/{unique_name}"
 }
 @app.post("/api/heart_abnormalities")
 async def heart_abnormalities(file: UploadFile = File(...)):
@@ -245,15 +263,24 @@ async def heart_abnormalities(file: UploadFile = File(...)):
 
     # 🔥 FIXED
     mask = predict_heart(file_path)
+    cardiac_mask = (mask == 1).astype(np.uint8)
+    thorax_mask  = (mask == 2).astype(np.uint8)
 
+    cardiac_d = max_horizontal_diameter(cardiac_mask)
+    thorax_d  = max_horizontal_diameter(thorax_mask)
+
+    if thorax_d == 0:
+        return None
+
+    ctr = cardiac_d / thorax_d
     colored = color_mask(mask)
-
     out_path = os.path.join(OUTPUT_DIR, unique_name)
     cv2.imwrite(out_path, colored)
 
     return {
-    "file_saved_as": unique_name,
-    "output_url": f"http://127.0.0.1:8000/outputs/{unique_name}"
+        "class_name": "normal" if ctr<0.55 else "abnormal" ,
+        "file_saved_as": unique_name,
+        "output_url": f"http://127.0.0.1:8000/outputs/{unique_name}"
 }
     
 uvicorn.run(app , host= "0.0.0.0", port=8000)
