@@ -208,48 +208,63 @@ def make_gradcam_heatmap(img_array, model, last_conv_layer_name, pred_index=None
 
 # ---------display---------
 def display_gradcam_multiclass(img_path, model, class_names, last_conv_layer_name='block14_sepconv2_act', threshold=0.3):
-    """
-    Draws outlines for all classes that have significant activation in the Grad-CAM,
-    labels each contour with the class name and probability.
-    """
-    # Load and preprocess
+
+    # Load + preprocess
     img = tf.keras.preprocessing.image.load_img(img_path, target_size=(299, 299))
     img_array = tf.keras.preprocessing.image.img_to_array(img)
     img_array = np.expand_dims(img_array, axis=0)
     img_array = tf.keras.applications.xception.preprocess_input(img_array)
 
-    # Grad-CAM heatmap for each class
+    # Original image
     outlined_img = cv2.imread(img_path)
     outlined_img = cv2.resize(outlined_img, (299, 299))
 
+    # 🔥 Get predictions once
+    preds = model.predict(img_array)
+    if isinstance(preds, list):
+        preds = preds[0]
+
+    preds = np.array(preds)
+
+    # 🔥 Get top class
+    top_idx = np.argmax(preds[0])
+    class_name = class_names[top_idx]
+    confidence = preds[0][top_idx]
+
+    # 🔥 Generate Grad-CAM ONLY for top class
+    heatmap, _ = make_gradcam_heatmap(
+        img_array, model, last_conv_layer_name, pred_index=top_idx
+    )
+
+    heatmap = cv2.resize(heatmap, (outlined_img.shape[1], outlined_img.shape[0]))
+
+    # Threshold mask
+    mask = np.uint8(heatmap > threshold * heatmap.max()) * 255
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
     color_map = {
-        "cerebellah-hypoplasia": (0, 255, 0),       # Green
-        "encephalocele": (255, 0, 0),               # Blue
-        "mild-ventriculomegaly": (0, 255, 255),     # Yellow
-        "moderate-ventriculomegaly": (255, 165, 0), # Orange
-        "normal": (255, 255, 255)                   # White
+        "cerebellah-hypoplasia": (0, 255, 0),
+        "encephalocele": (255, 0, 0),
+        "mild-ventriculomegaly": (0, 255, 255),
+        "moderate-ventriculomegaly": (255, 165, 0),
+        "normal": (255, 255, 255)
     }
 
-    for idx, class_name in enumerate(class_names):
-        heatmap, preds = make_gradcam_heatmap(img_array, model, last_conv_layer_name, pred_index=idx)
-        preds=np.array(preds)
-        heatmap = cv2.resize(heatmap, (outlined_img.shape[1], outlined_img.shape[0]))
+    color = color_map.get(class_name, (0, 255, 0))
 
-        # Only show significant activations
-        mask = np.uint8(heatmap > threshold * heatmap.max()) * 255
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # 🔥 Draw ONLY top class contours
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        label = f"{class_name} {confidence*100:.1f}%"
 
-        for cnt in contours:
-            x, y, w, h = cv2.boundingRect(cnt)
-            label = f"{class_name} {preds[0][idx]*100:.1f}%"
-            color = color_map.get(class_name, (0, 255, 0))
-            cv2.drawContours(outlined_img, [cnt], -1, color, 3)
-            cv2.putText(outlined_img, label, (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2, cv2.LINE_AA)
+        cv2.drawContours(outlined_img, [cnt], -1, color, 3)
+        cv2.putText(outlined_img, label, (x, y-5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2, cv2.LINE_AA)
 
-    # Convert to RGB for plotting
     outlined_img = cv2.cvtColor(outlined_img, cv2.COLOR_BGR2RGB)
-    return outlined_img
 
+    return outlined_img
 # -------- HEART --------
 def predict_heart(image_path):
     image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
