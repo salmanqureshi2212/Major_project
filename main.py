@@ -8,6 +8,7 @@ from torch.utils.data import Dataset, DataLoader
 import cv2
 from torchvision import transforms
 from fastapi import FastAPI, File, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 import uuid
 import uvicorn
 # -------- CONFIG --------
@@ -179,6 +180,75 @@ def predict_brain(image_path):
     confidence = preds[0][predicted_class]
 
     return class_names[predicted_class], confidence
+# ------GRAD_CAM--------------
+def make_gradcam_heatmap(img_array, model, last_conv_layer_name, pred_index=None):
+    grad_model = tf.keras.models.Model(
+        [model.inputs],
+        [model.get_layer(last_conv_layer_name).output, model.output]
+    )
+
+    with tf.GradientTape() as tape:
+        conv_outputs, predictions = grad_model(img_array)
+        if isinstance(predictions, list):
+            predictions = predictions[0]
+        if pred_index is None:
+            pred_index = tf.argmax(predictions[0])
+        class_channel = predictions[:, pred_index]
+
+    grads = tape.gradient(class_channel, conv_outputs)
+    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+    conv_outputs = conv_outputs[0]
+
+    heatmap = conv_outputs @ pooled_grads[..., tf.newaxis]
+    heatmap = tf.squeeze(heatmap)
+    heatmap = tf.maximum(heatmap, 0) / tf.math.reduce_max(heatmap)
+    return heatmap.numpy(), predictions.numpy()
+
+
+
+# ---------display---------
+def display_gradcam_multiclass(img_path, model, class_names, last_conv_layer_name='block14_sepconv2_act', threshold=0.3):
+    """
+    Draws outlines for all classes that have significant activation in the Grad-CAM,
+    labels each contour with the class name and probability.
+    """
+    # Load and preprocess
+    img = tf.keras.preprocessing.image.load_img(img_path, target_size=(299, 299))
+    img_array = tf.keras.preprocessing.image.img_to_array(img)
+    img_array = np.expand_dims(img_array, axis=0)
+    img_array = tf.keras.applications.xception.preprocess_input(img_array)
+
+    # Grad-CAM heatmap for each class
+    outlined_img = cv2.imread(img_path)
+    outlined_img = cv2.resize(outlined_img, (299, 299))
+
+    color_map = {
+        "cerebellah-hypoplasia": (0, 255, 0),       # Green
+        "encephalocele": (255, 0, 0),               # Blue
+        "mild-ventriculomegaly": (0, 255, 255),     # Yellow
+        "moderate-ventriculomegaly": (255, 165, 0), # Orange
+        "normal": (255, 255, 255)                   # White
+    }
+
+    for idx, class_name in enumerate(class_names):
+        heatmap, preds = make_gradcam_heatmap(img_array, model, last_conv_layer_name, pred_index=idx)
+        preds=np.array(preds)
+        heatmap = cv2.resize(heatmap, (outlined_img.shape[1], outlined_img.shape[0]))
+
+        # Only show significant activations
+        mask = np.uint8(heatmap > threshold * heatmap.max()) * 255
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        for cnt in contours:
+            x, y, w, h = cv2.boundingRect(cnt)
+            label = f"{class_name} {preds[0][idx]*100:.1f}%"
+            color = color_map.get(class_name, (0, 255, 0))
+            cv2.drawContours(outlined_img, [cnt], -1, color, 3)
+            cv2.putText(outlined_img, label, (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2, cv2.LINE_AA)
+
+    # Convert to RGB for plotting
+    outlined_img = cv2.cvtColor(outlined_img, cv2.COLOR_BGR2RGB)
+    return outlined_img
 
 # -------- HEART --------
 def predict_heart(image_path):
@@ -207,6 +277,19 @@ def color_mask(mask):
     colored[mask == 2] = [0, 255, 0]   # thorax (green)
 
     return colored
+def get_ctr(mask):
+    cardiac_mask = (mask == 1).astype(np.uint8)
+    thorax_mask  = (mask == 2).astype(np.uint8)
+
+    cardiac_d = max_horizontal_diameter(cardiac_mask)
+    thorax_d  = max_horizontal_diameter(thorax_mask)
+
+    if thorax_d == 0:
+        return None
+
+    ctr = cardiac_d / thorax_d
+    return ctr
+
 
 def max_horizontal_diameter(mask):
     """
@@ -229,6 +312,13 @@ app = FastAPI()
 from fastapi.staticfiles import StaticFiles
 app.mount("/outputs", StaticFiles(directory="outputs"), name="outputs")
 app.mount("/inputs", StaticFiles(directory="inputs"), name="inputs")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # allow all domains
+    allow_credentials=True,
+    allow_methods=["*"],  # allow all HTTP methods
+    allow_headers=["*"],  # allow all headers
+)
 @app.post("/api/brain_abnormalities")
 async def brain_abnormalities(file: UploadFile = File(...)):
     # -------- GENERATE UNIQUE FILENAME --------
@@ -244,6 +334,10 @@ async def brain_abnormalities(file: UploadFile = File(...)):
     # -------- PREDICT --------
     class_name ,confidence = predict_brain(file_path)
     confidence = float(confidence)
+    output_image = display_gradcam_multiclass(file_path,brain_model,class_names)
+    out_path = os.path.join(OUTPUT_DIR, unique_name)
+    cv2.imwrite(out_path, output_image)
+
     return {
         "class_name":class_name,
         "confidence": confidence,
@@ -263,22 +357,50 @@ async def heart_abnormalities(file: UploadFile = File(...)):
 
     # 🔥 FIXED
     mask = predict_heart(file_path)
-    cardiac_mask = (mask == 1).astype(np.uint8)
-    thorax_mask  = (mask == 2).astype(np.uint8)
+    ctr = get_ctr(mask)
+    
+    # Read original image
+    original = cv2.imread(file_path)
 
-    cardiac_d = max_horizontal_diameter(cardiac_mask)
-    thorax_d  = max_horizontal_diameter(thorax_mask)
+    # Resize mask to match original image
+    mask_resized = cv2.resize(mask, (original.shape[1], original.shape[0]), interpolation=cv2.INTER_NEAREST)
 
-    if thorax_d == 0:
-        return None
+    alpha = 0.2  # 🔥 change this (0.3 = light, 0.7 = strong)
 
-    ctr = cardiac_d / thorax_d
-    colored = color_mask(mask)
+    # Resize mask
+    mask_resized = cv2.resize(mask, (original.shape[1], original.shape[0]), interpolation=cv2.INTER_NEAREST)
+
+    # Create colored mask
+    colored = np.zeros((mask_resized.shape[0], mask_resized.shape[1], 3), dtype=np.uint8)
+    colored[mask_resized == 1] = [255, 0, 0]   # red
+    colored[mask_resized == 2] = [0, 255, 0]   # green
+
+    # Convert original to grayscale (clean base)
+    gray = cv2.cvtColor(original, cv2.COLOR_BGR2GRAY)
+    gray_3ch = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+    # Copy original
+    overlay = gray_3ch.copy()
+
+    # 🔥 Apply opacity ONLY on masked regions
+    mask_region = mask_resized > 0
+
+    overlay[mask_region] = (
+        gray_3ch[mask_region] * (1 - alpha) +
+        colored[mask_region] * alpha
+    ).astype(np.uint8)
+    
+    # Save
     out_path = os.path.join(OUTPUT_DIR, unique_name)
-    cv2.imwrite(out_path, colored)
+    threshold = 0.55
+    confidence = abs(ctr - threshold) / threshold
+    confidence = min(confidence, 1.0)
 
+    # Save
+    cv2.imwrite(out_path, overlay)
     return {
         "class_name": "normal" if ctr<0.55 else "abnormal" ,
+        "confidence": float(confidence),
         "file_saved_as": unique_name,
         "output_url": f"http://127.0.0.1:8000/outputs/{unique_name}"
 }
