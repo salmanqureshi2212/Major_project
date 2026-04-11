@@ -1,18 +1,23 @@
+from datetime import datetime
 import os
 import cv2
 import numpy as np
 import tensorflow as tf
 import torch
+import timm
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import cv2
 from torchvision import transforms
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, Form,UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 import uuid
 import uvicorn
+import sqlite3
+
+
 # -------- CONFIG --------
-MODEL_PATH = "model.h5"
+DB_PATH = "database.db"
 INPUT_DIR = "./inputs"
 IMAGE_SIZE_BRAIN = 299   # ⚠️ change based on your model
 IMAGE_SIZE_HEART = 256   # ⚠️ change based on your model
@@ -20,9 +25,10 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BRAIN_MODEL_PATH = os.path.join(BASE_DIR, ".", "models", "brain_model.h5")
 HEART_MODEL_PATH = os.path.join(BASE_DIR, ".", "models", "heart_model.pth")
+ROUTER_MODEL_PATH = os.path.join(BASE_DIR, ".", "models", "router_model_v2.pth")
 INPUT_DIR= os.path.join(BASE_DIR, ".", "inputs")
 OUTPUT_DIR= os.path.join(BASE_DIR, ".", "outputs")
-# -------- LOAD MODEL --------
+# -------- LOAD BRAIN MODEL --------
 brain_model = tf.keras.models.load_model(BRAIN_MODEL_PATH)
 print("✅ brain Model loaded")
 # -------- LOAD HEART MODEL --------
@@ -72,7 +78,6 @@ class DoubleConv(nn.Module):
 
     def forward(self, x):
         return self.block(x)
-
 class AttentionUNet(nn.Module):
     def __init__(self, num_classes=3):
         super().__init__()
@@ -145,16 +150,43 @@ heart_model.eval()
 
 print("✅ heart Model loaded")
 
+# -------------LOAD ROUTER AGENT ------------------
+
+router_model = timm.create_model("xception", pretrained=False, num_classes=3)
+
+router_model.load_state_dict(
+    torch.load(ROUTER_MODEL_PATH,map_location=DEVICE),
+    strict=False
+)
+router_model.to(DEVICE)
+router_model.eval()
+print("✅ Router Model Loaded")
 # -------- TRANSFORM --------
 transform = transforms.Compose([
     transforms.ToPILImage(),
     transforms.Resize((IMAGE_SIZE_HEART, IMAGE_SIZE_HEART)),
     transforms.ToTensor(),
 ])
+router_transform = transforms.Compose([
+    transforms.ToPILImage(),
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+])
 
-# -------- BRAIN --------
 # -------- CLASS LABELS --------
 class_names = ["Cerebellah-hypoplasia", "encephalocele","mild-ventriculomegaly","moderate-ventriculomegaly","normal"]  # ⚠️ change according to your model
+router_class_names =  ['Fetal brain', 'Fetal thorax', 'Other']
+
+
+# -----------------SQL --------------
+def get_conn():
+    conn = sqlite3.connect(DB_PATH)
+    return conn
+
+# -------------BRAIN FUNCTIONS -------------
+
+
+
 
 # -------- PREPROCESS --------
 def preprocess_brain(image_path):
@@ -169,7 +201,6 @@ def preprocess_brain(image_path):
     image = np.expand_dims(image, axis=0)  # (1, H, W, 3)
 
     return image
-
 # -------- PREDICT --------
 def predict_brain(image_path):
     img = preprocess_brain(image_path)
@@ -203,9 +234,6 @@ def make_gradcam_heatmap(img_array, model, last_conv_layer_name, pred_index=None
     heatmap = tf.squeeze(heatmap)
     heatmap = tf.maximum(heatmap, 0) / tf.math.reduce_max(heatmap)
     return heatmap.numpy(), predictions.numpy()
-
-
-
 # ---------display---------
 def display_gradcam_multiclass(img_path, model, class_names, last_conv_layer_name='block14_sepconv2_act', threshold=0.3):
 
@@ -265,7 +293,15 @@ def display_gradcam_multiclass(img_path, model, class_names, last_conv_layer_nam
     outlined_img = cv2.cvtColor(outlined_img, cv2.COLOR_BGR2RGB)
 
     return outlined_img
-# -------- HEART --------
+
+
+
+
+# -------------HEART FUNCTIONS -------------
+
+
+
+
 def predict_heart(image_path):
     image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
 
@@ -304,8 +340,6 @@ def get_ctr(mask):
 
     ctr = cardiac_d / thorax_d
     return ctr
-
-
 def max_horizontal_diameter(mask):
     """
     mask: binary mask (H, W)
@@ -322,7 +356,132 @@ def max_horizontal_diameter(mask):
             diameters.append(cols[-1] - cols[0])
 
     return float(max(diameters)) if diameters else 0.0
+
+
+
+
+
+#------------ROUTER FUNCTIONS------------
+
+def route_image(model, image):
+    threshold = 0.6
+    margin_threshold = 0.2
+
+    with torch.no_grad():
+        image = image.unsqueeze(0).to(DEVICE)
+
+        outputs = model(image)
+        probs = torch.softmax(outputs, dim=1)
+
+        top2_probs, top2_idx = torch.topk(probs, 2, dim=1)
+
+        conf = top2_probs[0, 0].item()
+        margin = (top2_probs[0, 0] - top2_probs[0, 1]).item()
+        pred = top2_idx[0, 0].item()
+
+        if conf < threshold or margin < margin_threshold:
+            return "Other", conf
+        else:
+            return router_class_names[pred], conf
+
+def full_pipeline(image_path , unique_name):
+
+    # Load image using cv2 (BGR by default)
+    img = cv2.imread(image_path)
+
+    if img is None:
+        raise ValueError(f"❌ Failed to load {image_path}")
+
+    # Convert BGR → RGB (VERY IMPORTANT, since PIL uses RGB)
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+    # ---------------- ROUTER ----------------
+    img_router = router_transform(img_rgb)
+    label, conf = route_image(router_model, img_router)
+    # ---------------- ROUTING ----------------
+    if label == "Fetal thorax":
+        mask = predict_heart(image_path)
+        ctr = get_ctr(mask)
+        
+        # Read original image
+        original = img
+
+        # Resize mask to match original image
+        mask_resized = cv2.resize(mask, (original.shape[1], original.shape[0]), interpolation=cv2.INTER_NEAREST)
+
+        alpha = 0.2  # 🔥 change this (0.3 = light, 0.7 = strong)
+
+        # Resize mask
+        mask_resized = cv2.resize(mask, (original.shape[1], original.shape[0]), interpolation=cv2.INTER_NEAREST)
+
+        # Create colored mask
+        colored = np.zeros((mask_resized.shape[0], mask_resized.shape[1], 3), dtype=np.uint8)
+        colored[mask_resized == 1] = [255, 0, 0]   # red
+        colored[mask_resized == 2] = [0, 255, 0]   # green
+
+        # Convert original to grayscale (clean base)
+        gray = cv2.cvtColor(original, cv2.COLOR_BGR2GRAY)
+        gray_3ch = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+        # Copy original
+        overlay = gray_3ch.copy()
+
+        # 🔥 Apply opacity ONLY on masked regions
+        mask_region = mask_resized > 0
+
+        overlay[mask_region] = (
+            gray_3ch[mask_region] * (1 - alpha) +
+            colored[mask_region] * alpha
+        ).astype(np.uint8)
+        
+        # Save
+        out_path = os.path.join(OUTPUT_DIR, unique_name)
+        threshold = 0.55
+        confidence = abs(ctr - threshold) / threshold
+        confidence = min(confidence, 1.0)
+
+        # Save
+        cv2.imwrite(out_path, overlay)
+
+        return {
+        "detected":True,
+        "class_name": "normal" if ctr<0.55 else "abnormal" ,
+        "confidence": float(confidence),
+        "file_saved_as": unique_name,
+        "output_url": f"http://127.0.0.1:8000/outputs/{unique_name}"
+        }
+    
+    elif label == "Fetal brain":
+        class_name ,confidence = predict_brain(image_path)
+        confidence = float(confidence)
+        output_image = display_gradcam_multiclass(image_path,brain_model,class_names)
+        out_path = os.path.join(OUTPUT_DIR, unique_name)
+        cv2.imwrite(out_path, output_image)
+        return {
+        "detected":True,
+        "class_name":class_name,
+        "confidence": confidence,
+        "file_saved_as": unique_name,
+        "output_url": f"http://127.0.0.1:8000/outputs/{unique_name}"
+}
+        
+    else:
+        return {
+                
+                "detected":False,
+                "class_name": "Cannot Recognise the organ" ,
+                "confidence": float(0),
+                "file_saved_as": unique_name,
+                "output_url": f"http://127.0.0.1:8000/outputs/{unique_name}"
+        }
+        
+
+
+
 # -------- FASTAPI --------
+
+
+
 app = FastAPI()
 from fastapi.staticfiles import StaticFiles
 app.mount("/outputs", StaticFiles(directory="outputs"), name="outputs")
@@ -339,17 +498,17 @@ async def brain_abnormalities(file: UploadFile = File(...)):
     # -------- GENERATE UNIQUE FILENAME --------
     file_ext = file.filename.split(".")[-1]
     unique_name = f"{uuid.uuid4()}.{file_ext}"
-    file_path = os.path.join(INPUT_DIR, unique_name)
+    image_path=image_path = os.path.join(INPUT_DIR, unique_name)
 
     # -------- SAVE FILE --------
     contents = await file.read()
-    with open(file_path, "wb") as f:
+    with open(image_path, "wb") as f:
         f.write(contents)
 
     # -------- PREDICT --------
-    class_name ,confidence = predict_brain(file_path)
+    class_name ,confidence = predict_brain(image_path)
     confidence = float(confidence)
-    output_image = display_gradcam_multiclass(file_path,brain_model,class_names)
+    output_image = display_gradcam_multiclass(image_path,brain_model,class_names)
     out_path = os.path.join(OUTPUT_DIR, unique_name)
     cv2.imwrite(out_path, output_image)
 
@@ -364,18 +523,18 @@ async def heart_abnormalities(file: UploadFile = File(...)):
 
     file_ext = file.filename.split(".")[-1]
     unique_name = f"{uuid.uuid4()}.{file_ext}"
-    file_path = os.path.join(INPUT_DIR, unique_name)
+    image_path=image_path = os.path.join(INPUT_DIR, unique_name)
 
     contents = await file.read()
-    with open(file_path, "wb") as f:
+    with open(image_path, "wb") as f:
         f.write(contents)
 
     # 🔥 FIXED
-    mask = predict_heart(file_path)
+    mask = predict_heart(image_path)
     ctr = get_ctr(mask)
     
     # Read original image
-    original = cv2.imread(file_path)
+    original = cv2.imread(image_path)
 
     # Resize mask to match original image
     mask_resized = cv2.resize(mask, (original.shape[1], original.shape[0]), interpolation=cv2.INTER_NEAREST)
@@ -419,5 +578,66 @@ async def heart_abnormalities(file: UploadFile = File(...)):
         "file_saved_as": unique_name,
         "output_url": f"http://127.0.0.1:8000/outputs/{unique_name}"
 }
+ 
+@app.post("/api/inference")
+async def inference(
+    file: UploadFile = File(...),
+    name: str = Form(...)
+):
+    file_ext = file.filename.split(".")[-1]
+    unique_name = f"{uuid.uuid4()}.{file_ext}"
+    image_path = os.path.join(INPUT_DIR, unique_name)
+
+    # -------- SAVE FILE --------
+    contents = await file.read()
+    with open(image_path, "wb") as f:
+        f.write(contents)
+
+    # -------- RUN MODEL --------
+    output = full_pipeline(image_path, unique_name)
+    conn = get_conn()
+    cursor = conn.cursor()
+
+    severity = 1 if output["class_name"] == "normal" else 2
+    priority = output["confidence"] *output["detected"]* severity
     
+    cursor.execute("""
+        INSERT INTO records 
+        (name, date, detected, detected_name, organ, confidence, priority, input_image, output_image)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        name,
+        datetime.now().date(),
+        int(output["detected"]),
+        output["class_name"],
+        name,
+        output["confidence"],
+        priority,
+        image_path,
+        output["output_url"]
+    ))
+
+    # 🔥 GET INSERTED ROW ID
+    inserted_id = cursor.lastrowid
+
+    conn.commit()
+    return {
+        "id": inserted_id,
+        **output
+    }    
+
+@app.get("/api/records")
+def get_all_records():
+    conn = get_conn()
+    conn.row_factory = sqlite3.Row  # allows dict-like access
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM records")
+    rows = cursor.fetchall()
+    # convert to list of dicts (JSON serializable)
+    result = [dict(row) for row in rows]
+
+    return {
+        "count": len(result),
+        "data": result
+    }
 uvicorn.run(app , host= "0.0.0.0", port=8000)
